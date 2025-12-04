@@ -95,6 +95,22 @@ cd FlashVSR
 
 #### 2️⃣ Set Up the Python Environment
 
+##### Option A: Using Conda with `environment.yaml` (Recommended)
+
+You can set up a complete Conda environment with all necessary packages (including those from `pip`) using the provided `environment.yaml` file.
+
+```bash
+conda env create -f environment.yaml
+conda activate flashvsr
+```
+
+To deactivate the environment:
+```bash
+conda deactivate
+```
+
+##### Option B: Manual Setup
+
 Create and activate the environment (**Python 3.11.13**):
 
 ```bash
