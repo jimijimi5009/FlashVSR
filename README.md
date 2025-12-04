@@ -81,126 +81,24 @@ Thanks again to the community for actively testing and helping improve FlashVSR 
 
 ### 🚀 Getting Started
 
-Follow these steps to set up and run **FlashVSR** on your local machine:
+To get started with FlashVSR, follow these steps:
 
-> ⚠️ **Note:** This project is primarily designed and optimized for **4× video super-resolution**.  
-> We **strongly recommend** using the **4× SR setting** to achieve better results and stability. ✅
+1.  **Activate your Conda environment:**
+    If you have already set up the `flashvsr` environment using `environment.yaml`, activate it:
+    ```bash
+    conda activate flashvsr
+    ```
+    If you haven't, create and activate the environment using the `environment.yaml` file:
+    ```bash
+    conda env create -f environment.yaml
+    conda activate flashvsr
+    ```
 
-#### 1️⃣ Clone the Repository
-
-```bash
-git clone https://github.com/OpenImagingLab/FlashVSR
-cd FlashVSR
-````
-
-#### 2️⃣ Set Up the Python Environment
-
-##### Option A: Using Conda with `environment.yaml` (Recommended)
-
-You can set up a complete Conda environment with all necessary packages (including those from `pip`) using the provided `environment.yaml` file.
-
-```bash
-conda env create -f environment.yaml
-conda activate flashvsr
-```
-
-To deactivate the environment:
-```bash
-conda deactivate
-```
-
-##### Option B: Manual Setup
-
-Create and activate the environment (**Python 3.11.13**):
-
-```bash
-conda create -n flashvsr python=3.11.13
-conda activate flashvsr
-```
-
-Install project dependencies:
-
-```bash
-pip install -e .
-pip install -r requirements.txt
-```
-
-#### 3️⃣ Install Block-Sparse Attention (Required)
-
-FlashVSR relies on the **Block-Sparse Attention** backend to enable flexible and dynamic attention masking for efficient inference.
-
-> **⚠️ Note:**
->
-> * The Block-Sparse Attention build process can be memory-intensive, especially when compiling in parallel with multiple `ninja` jobs. It is recommended to keep sufficient memory available during compilation to avoid OOM errors. Once the build is complete, runtime memory usage is stable and not an issue.
-> * Based on our testing, the Block-Sparse Attention backend works correctly on **NVIDIA A100 and A800** (Ampere) with **ideal acceleration performance**, and it also runs correctly on **H200** (Hopper) but the acceleration is limited due to hardware scheduling differences and sparse kernel behavior. **Compatibility and performance on other GPUs (e.g., RTX 40/50 series or H800) are currently unknown**. For more details, please refer to the official documentation: https://github.com/mit-han-lab/Block-Sparse-Attention
-
-
-```bash
-# ✅ Recommended: clone and install in a separate clean folder (outside the FlashVSR repo)
-git clone https://github.com/mit-han-lab/Block-Sparse-Attention
-cd Block-Sparse-Attention
-pip install packaging
-pip install ninja
-python setup.py install
-```
-
-#### 4️⃣ Download Model Weights from Hugging Face
-
-FlashVSR provides both **v1** and **v1.1** model weights on Hugging Face (via **Git LFS**).  
-Please install Git LFS first:
-
-```bash
-# From the repo root
-cd examples/WanVSR
-
-# Install Git LFS (once per machine)
-git lfs install
-
-# Clone v1 (original) or v1.1 (recommended)
-git lfs clone https://huggingface.co/JunhaoZhuang/FlashVSR          # v1
-# or
-git lfs clone https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1      # v1.1
-```
-
-After cloning, you should have one of the following folders:
-
-```
-./examples/WanVSR/FlashVSR/          # v1
-./examples/WanVSR/FlashVSR-v1.1/     # v1.1
-│
-├── LQ_proj_in.ckpt
-├── TCDecoder.ckpt
-├── Wan2.1_VAE.pth
-├── diffusion_pytorch_model_streaming_dmd.safetensors
-└── README.md
-```
-
-> Inference scripts automatically load weights from the corresponding folder.
-
----
-
-#### 5️⃣ Run Inference
-
-```bash
-# From the repo root
-cd examples/WanVSR
-
-# v1 (original)
-python infer_flashvsr_full.py
-# or
-python infer_flashvsr_tiny.py
-# or
-python infer_flashvsr_tiny_long_video.py
-
-# v1.1 (recommended)
-python infer_flashvsr_v1.1_full.py
-# or
-python infer_flashvsr_v1.1_tiny.py
-# or
-python infer_flashvsr_v1.1_tiny_long_video.py
-```
-
----
+2.  **Run the application:**
+    Use the provided script to launch the web UI or the main application:
+    ```bash
+    ./launch_webui.sh
+    ```
 
 ### 🛠️ Method
 
