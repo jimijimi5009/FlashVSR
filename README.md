@@ -95,10 +95,7 @@ Follow these steps to set up and run FlashVSR:
     conda env create -f environment.yaml
     conda activate flashvsr
     ```
-    To deactivate the environment:
-    ```bash
-    conda deactivate
-    ```
+
 
 3.  **Run the application:**
     Use the provided script to launch the web UI or the main application:
