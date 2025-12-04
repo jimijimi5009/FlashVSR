@@ -81,20 +81,26 @@ Thanks again to the community for actively testing and helping improve FlashVSR 
 
 ### 🚀 Getting Started
 
-To get started with FlashVSR, follow these steps:
+Follow these steps to set up and run FlashVSR:
 
-1.  **Activate your Conda environment:**
-    If you have already set up the `flashvsr` environment using `environment.yaml`, activate it:
+1.  **Clone the repository:**
     ```bash
-    conda activate flashvsr
+    git clone https://github.com/jimijimi5009/FlashVSR.git
+    cd FlashVSR
     ```
-    If you haven't, create and activate the environment using the `environment.yaml` file:
+
+2.  **Set up the Conda environment:**
+    Create and activate the `flashvsr` environment using the provided `environment.yaml` file:
     ```bash
     conda env create -f environment.yaml
     conda activate flashvsr
     ```
+    To deactivate the environment:
+    ```bash
+    conda deactivate
+    ```
 
-2.  **Run the application:**
+3.  **Run the application:**
     Use the provided script to launch the web UI or the main application:
     ```bash
     ./launch_webui.sh
