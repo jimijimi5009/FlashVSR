@@ -10,9 +10,30 @@ from PIL import Image
 import imageio
 from tqdm import tqdm
 from einops import rearrange
+import re
+import math
 
 from diffsynth import ModelManager, FlashVSRFullPipeline
 from utils.utils import Causal_LQ4x_Proj
+import diffsynth.models.wan_video_vae
+
+# --- Monkey-patch for build_1d_mask ---
+def corrected_build_1d_mask(self, length, is_bound_0, is_bound_1, border_width):
+    x = torch.ones((length,))
+    if length == 0:
+        return x
+    if not is_bound_0:
+        slice_len = min(length, border_width)
+        ramp = (torch.arange(border_width, device=x.device) + 1) / border_width
+        x[:slice_len] = ramp[:slice_len]
+    if not is_bound_1:
+        slice_len = min(length, border_width)
+        ramp = torch.flip((torch.arange(border_width, device=x.device) + 1) / border_width, dims=(0,))
+        x[-slice_len:] = ramp[-slice_len:]
+    return x
+
+diffsynth.models.wan_video_vae.WanVideoVAE.build_1d_mask = corrected_build_1d_mask
+# --- End of Monkey-patch ---
 
 def natural_key(name: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'([0-9]+)', os.path.basename(name))]
@@ -152,7 +173,6 @@ def init_pipeline(num_persistent_param_in_dit):
     pipe.init_cross_kv(); pipe.load_models_to_device(["dit","vae"])
     return pipe
 
-import math
 def calculate_tile_coords(height, width, tile_size, overlap):
     coords = []
     stride = tile_size - overlap
@@ -170,92 +190,13 @@ def create_feather_mask(size, overlap):
     H, W = size
     mask = torch.ones(1, 1, H, W)
     ramp = torch.linspace(0, 1, overlap)
-    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
-    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
-    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
-    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    if W > 0:
+        mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
+        mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    if H > 0:
+        mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
+        mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
     return mask
-
-def stitch_video_tiles(
-    tile_paths, 
-    tile_coords, 
-    final_dims, 
-    scale, 
-    overlap, 
-    output_path, 
-    fps, 
-    quality, 
-    cleanup=True,
-    chunk_size=40
-):
-    if not tile_paths:
-        return
-    
-    final_W, final_H = final_dims
-    
-    readers = [imageio.get_reader(p) for p in tile_paths]
-    
-    try:
-        num_frames = readers[0].count_frames()
-        if num_frames is None or num_frames <= 0:
-            num_frames = len([_ for _ in readers[0]])
-            for r in readers: r.close()
-            readers = [imageio.get_reader(p) for p in tile_paths]
-            
-        with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
-            for start_frame in tqdm(range(0, num_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
-                end_frame = min(start_frame + chunk_size, num_frames)
-                current_chunk_size = end_frame - start_frame
-                chunk_canvas = np.zeros((current_chunk_size, final_H, final_W, 3), dtype=np.float32)
-                weight_canvas = np.zeros_like(chunk_canvas, dtype=np.float32)
-                
-                for i, reader in enumerate(readers):
-                    try:
-                        tile_chunk_frames = [
-                            frame.astype(np.float32) / 255.0 
-                            for idx, frame in enumerate(reader.iter_data()) 
-                            if start_frame <= idx < end_frame
-                        ]
-                        tile_chunk_np = np.stack(tile_chunk_frames, axis=0)
-                    except Exception as e:
-                        continue
-                    
-                    if tile_chunk_np.shape[0] != current_chunk_size:
-                        continue
-                    
-                    tile_H, tile_W, _ = tile_chunk_np.shape[1:]
-                    ramp = np.linspace(0, 1, overlap * scale, dtype=np.float32)
-                    mask = np.ones((tile_H, tile_W, 1), dtype=np.float32)
-                    mask[:, :overlap*scale, :] *= ramp[np.newaxis, :, np.newaxis]
-                    mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
-                    mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
-                    mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
-                    mask_4d = mask[np.newaxis, :, :, :]
-                    
-                    x1_orig, y1_orig, _, _ = tile_coords[i]
-                    out_y1, out_x1 = y1_orig * scale, x1_orig * scale
-                    out_y2, out_x2 = out_y1 + tile_H, out_x1 + tile_W
-                    
-                    chunk_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += tile_chunk_np * mask_4d
-                    weight_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_4d
-                    
-                weight_canvas[weight_canvas == 0] = 1.0
-                stitched_chunk = chunk_canvas / weight_canvas
-                
-                for frame_idx_in_chunk in range(current_chunk_size):
-                    frame_uint8 = (np.clip(stitched_chunk[frame_idx_in_chunk], 0, 1) * 255).astype(np.uint8)
-                    writer.append_data(frame_uint8)
-                    
-    finally:
-        for reader in readers:
-            reader.close()
-            
-    if cleanup:
-        for path in tile_paths:
-            try:
-                os.remove(path)
-            except OSError as e:
-                pass
 
 def clean_vram():
     torch.cuda.empty_cache()
@@ -285,7 +226,7 @@ def prepare_input_tensor_for_tile(image_tensor: torch.Tensor, device, scale: int
     frames = []
     for i in range(num_frames_padded):
         frame_idx = min(i, N0 - 1)
-        frame_slice = image_tensor[frame_idx].to(device)
+        frame_slice = image_tensor[frame_idx].to(device) / 255.0
         tensor_bchw = frame_slice.permute(2, 0, 1).unsqueeze(0)
         upscaled_tensor = F.interpolate(tensor_bchw, size=(h0 * scale, w0 * scale), mode='bicubic', align_corners=False)
         l, t = max(0, (w0 * scale - tW) // 2), max(0, (h0 * scale - tH) // 2)
@@ -297,7 +238,93 @@ def prepare_input_tensor_for_tile(image_tensor: torch.Tensor, device, scale: int
     clean_vram()
     return vid_final, tH, tW, num_frames_padded
 
-def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w, num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap):
+def run_image_inference(image_input_path, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w, num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap, num_inference_steps_val, num_frames_for_sequence_val):
+    if image_input_path is None:
+        raise gr.Error("No image uploaded.")
+
+    pipe = init_pipeline(num_persistent_param_in_dit)
+    
+    dtype, device = torch.bfloat16, 'cuda'
+    
+    image = Image.open(image_input_path).convert('RGB')
+    frame_tensor = torch.from_numpy(np.array(image)).to(dtype=dtype).unsqueeze(0)
+
+    if tiled_dit:
+        num_frames_for_sequence = num_frames_for_sequence_val
+        frames = frame_tensor.repeat(num_frames_for_sequence, 1, 1, 1)
+
+        N, H, W, C = frames.shape
+        tile_coords = calculate_tile_coords(H, W, dit_tile_size, dit_tile_overlap)
+        
+        final_output_canvas = torch.zeros((H * scale, W * scale, C), dtype=torch.float32)
+        weight_sum_canvas = torch.zeros_like(final_output_canvas, dtype=torch.float32)
+
+        print(f"Processing in {len(tile_coords)} tiles...")
+        for i, (x1, y1, x2, y2) in enumerate(tqdm(tile_coords, desc="[FlashVSR] Processing image tiles")):
+            input_tile = frames[:, y1:y2, x1:x2, :]
+            
+            LQ_tile, th, tw, F = prepare_input_tensor_for_tile(input_tile, device, scale=scale, dtype=dtype)
+            LQ_tile = LQ_tile.to(device)
+
+            with torch.no_grad():
+                processed_tile_output_tensor = pipe(
+                    prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=num_inference_steps_val, seed=0,
+                    tiled=tiled,
+                    tile_size=(tile_size_h, tile_size_w),
+                    tile_stride=(tile_stride_h, tile_stride_w),
+                    LQ_video=LQ_tile, 
+                    num_frames=F,
+                    height=th,
+                    width=tw,
+                    is_full_block=False, 
+                    if_buffer=True,
+                    topk_ratio=2.0*768*1280/(th*tw), 
+                    kv_ratio=3.0,
+                    local_range=11,
+                    color_fix = True,
+                )
+            
+            single_frame_output_tensor = processed_tile_output_tensor[:, 0, :, :]
+            
+            processed_tile_tensor_0_1 = ((single_frame_output_tensor + 1.0) / 2.0).permute(1, 2, 0).cpu().float()
+            
+            mask = create_feather_mask((processed_tile_tensor_0_1.shape[0], processed_tile_tensor_0_1.shape[1]), dit_tile_overlap * scale).cpu()
+            
+            mask_expanded = mask.squeeze(0).squeeze(0).unsqueeze(2).repeat(1, 1, 3)
+
+            x1_s, y1_s = x1 * scale, y1 * scale
+            x2_s, y2_s = x1_s + processed_tile_tensor_0_1.shape[1], y1_s + processed_tile_tensor_0_1.shape[0]
+
+            final_output_canvas[y1_s:y2_s, x1_s:x2_s, :] += processed_tile_tensor_0_1 * mask_expanded
+            weight_sum_canvas[y1_s:y2_s, x1_s:x2_s, :] += mask_expanded
+            
+            del LQ_tile, processed_tile_output_tensor, single_frame_output_tensor, processed_tile_tensor_0_1, mask, mask_expanded; clean_vram()
+
+        weight_sum_canvas[weight_sum_canvas == 0] = 1.0
+        output_tensor_final = final_output_canvas / weight_sum_canvas
+        
+        output_image_pil = Image.fromarray(
+            (output_tensor_final.numpy() * 255).clip(0, 255).astype(np.uint8)
+        )
+
+    else:
+        raise gr.Error("Non-tiled DiT for images is not recommended. Please enable 'Tiled DiT'.")
+
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    # Create a unique filename for the output image
+    input_filename = os.path.basename(image_input_path)
+    name, ext = os.path.splitext(input_filename)
+    output_filename = f"{name}_{scale}x_upscaled.png" # Always save as PNG for quality
+    output_path = os.path.join(output_dir, output_filename)
+    output_image_pil.save(output_path)
+
+    del pipe
+    clean_vram()
+    
+    return output_path
+
+def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w, num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap, num_inference_steps_val):
     
     pipe = init_pipeline(num_persistent_param_in_dit)
     
@@ -319,7 +346,7 @@ def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_strid
             LQ_tile = LQ_tile.to(device)
             
             output_tile_gpu = pipe(
-                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=0,
+                prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=num_inference_steps_val, seed=0,
                 tiled=tiled,
                 tile_size=(tile_size_h, tile_size_w),
                 tile_stride=(tile_stride_h, tile_stride_w),
@@ -330,11 +357,9 @@ def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_strid
                 color_fix = True,
             )
             
-            # Get tensor output in [0, 1] range
             processed_tile_cpu_tensor = tensor2video(output_tile_gpu, return_tensor=True).cpu() # T H W C, [0, 1]
             
             mask = create_feather_mask((processed_tile_cpu_tensor.shape[1], processed_tile_cpu_tensor.shape[2]), dit_tile_overlap * scale).cpu().permute(0, 2, 3, 1) # 1 H W C
-            # Expand mask to match number of frames
             mask_expanded = mask.repeat(processed_tile_cpu_tensor.shape[0], 1, 1, 1) # T H W C
             
             x1_s, y1_s = x1 * scale, y1 * scale
@@ -347,16 +372,14 @@ def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_strid
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         video_output_tensor = final_output_canvas / weight_sum_canvas # T H W C, [0, 1]
         
-        # Convert the final accumulated tensor to PIL Images
         video = (video_output_tensor * 255).clip(0, 255).numpy().astype(np.uint8)
         video = [Image.fromarray(frame) for frame in video]
         fps = original_fps
     else:
-        # Non-tiled DiT logic
         LQ, th, tw, F, fps = prepare_input_tensor(video_path, scale=scale, dtype=dtype, device=device)
 
         video = pipe(
-            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=0, 
+            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=num_inference_steps_val, seed=0, 
             tiled=tiled,
             tile_size=(tile_size_h, tile_size_w),
             tile_stride=(tile_stride_h, tile_stride_w),
@@ -380,31 +403,63 @@ def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_strid
 
 with gr.Blocks() as demo:
     gr.Markdown("Note: If you are running into memory issues, try reducing the tile size and stride. You can also try setting the environment variable `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before running the script.")
-    with gr.Row():
-        with gr.Column():
-            video_input = gr.Video(label="Input Video")
-            scale_slider = gr.Slider(minimum=1, maximum=4, step=1, label="Scale Factor", value=4)
-            tiled_checkbox = gr.Checkbox(label="Tiled VAE", value=True)
-            tiled_dit_checkbox = gr.Checkbox(label="Tiled DiT", value=False)
+    
+    with gr.Tabs():
+        with gr.TabItem("Video"):
             with gr.Row():
-                tile_size_h_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Height", value=32)
-                tile_size_w_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Width", value=64)
-            with gr.Row():
-                tile_stride_h_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Height", value=16)
-                tile_stride_w_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Width", value=32)
-            with gr.Row():
-                dit_tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, label="DiT Tile Size", value=256)
-                dit_tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, label="DiT Tile Overlap", value=24)
-            run_button = gr.Button("Run Inference")
-        with gr.Column():
-            video_output = gr.Video(label="Output Video")
+                with gr.Column():
+                    video_input = gr.Video(label="Input Video")
+                    video_scale_slider = gr.Slider(minimum=1, maximum=4, step=1, label="Scale Factor", value=4)
+                    video_num_inference_steps_slider = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
+                    video_tiled_checkbox = gr.Checkbox(label="Tiled VAE", value=True)
+                    video_tiled_dit_checkbox = gr.Checkbox(label="Tiled DiT", value=False)
+                    with gr.Row():
+                        video_tile_size_h_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Height", value=32)
+                        video_tile_size_w_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Width", value=64)
+                    with gr.Row():
+                        video_tile_stride_h_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Height", value=16)
+                        video_tile_stride_w_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Width", value=32)
+                    with gr.Row():
+                        video_dit_tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, label="DiT Tile Size", value=256)
+                        video_dit_tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, label="DiT Tile Overlap", value=24)
+                    video_run_button = gr.Button("Run Video Inference")
+                with gr.Column():
+                    video_output = gr.Video(label="Output Video")
 
-    num_persistent_param_in_dit_slider = gr.Slider(minimum=0, maximum=10000000, step=100000, label="Persistent Parameters in DiT", value=0)
+        with gr.TabItem("Image"):
+            with gr.Row():
+                with gr.Column():
+                    image_input = gr.Image(type="filepath", label="Input Image")
+                    image_scale_slider = gr.Slider(minimum=1, maximum=4, step=1, label="Scale Factor", value=4)
+                    image_num_inference_steps_slider = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
+                    image_num_frames_for_sequence_slider = gr.Slider(minimum=1, maximum=25, step=1, label="Frames per Tile (Image)", value=25)
+                    image_tiled_checkbox = gr.Checkbox(label="Tiled VAE", value=True)
+                    image_tiled_dit_checkbox = gr.Checkbox(label="Tiled DiT", value=True)
+                    with gr.Row():
+                        image_tile_size_h_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Height", value=32)
+                        image_tile_size_w_slider = gr.Slider(minimum=32, maximum=256, step=16, label="VAE Tile Size Width", value=64)
+                    with gr.Row():
+                        image_tile_stride_h_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Height", value=16)
+                        image_tile_stride_w_slider = gr.Slider(minimum=16, maximum=128, step=16, label="VAE Tile Stride Width", value=32)
+                    with gr.Row():
+                        image_dit_tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, label="DiT Tile Size", value=256)
+                        image_dit_tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, label="DiT Tile Overlap", value=24)
+                    image_run_button = gr.Button("Run Image Inference")
+                with gr.Column():
+                    image_output = gr.Image(type="pil", label="Output Image")
 
-    run_button.click(
+    num_persistent_param_in_dit_slider = gr.Slider(minimum=0, maximum=10000000, step=100000, label="Persistent Parameters in DiT", value=0, interactive=True)
+
+    video_run_button.click(
         fn=run_inference,
-        inputs=[video_input, scale_slider, tiled_checkbox, tile_size_h_slider, tile_size_w_slider, tile_stride_h_slider, tile_stride_w_slider, num_persistent_param_in_dit_slider, tiled_dit_checkbox, dit_tile_size_slider, dit_tile_overlap_slider],
+        inputs=[video_input, video_scale_slider, video_tiled_checkbox, video_tile_size_h_slider, video_tile_size_w_slider, video_tile_stride_h_slider, video_tile_stride_w_slider, num_persistent_param_in_dit_slider, video_tiled_dit_checkbox, video_dit_tile_size_slider, video_dit_tile_overlap_slider, video_num_inference_steps_slider],
         outputs=video_output,
+    )
+    
+    image_run_button.click(
+        fn=run_image_inference,
+        inputs=[image_input, image_scale_slider, image_tiled_checkbox, image_tile_size_h_slider, image_tile_size_w_slider, image_tile_stride_h_slider, image_tile_stride_w_slider, num_persistent_param_in_dit_slider, image_tiled_dit_checkbox, image_dit_tile_size_slider, image_dit_tile_overlap_slider, image_num_inference_steps_slider, image_num_frames_for_sequence_slider],
+        outputs=image_output,
     )
 
 demo.launch()
