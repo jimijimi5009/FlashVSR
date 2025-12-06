@@ -12,6 +12,7 @@ from tqdm import tqdm
 from einops import rearrange
 import re
 import math
+import glob
 
 from diffsynth import ModelManager, FlashVSRFullPipeline
 from utils.utils import Causal_LQ4x_Proj
@@ -40,7 +41,7 @@ def natural_key(name: str):
 
 def list_images_natural(folder: str):
     exts = ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG')
-    fs = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(exts)]
+    fs = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(exts)]
     fs.sort(key=natural_key)
     return fs
 
@@ -153,7 +154,7 @@ def prepare_input_tensor(path: str, scale: int = 4, dtype=torch.bfloat16, device
     return vid, tH, tW, F, fps
 
 def init_pipeline(num_persistent_param_in_dit):
-    print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
+    # print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device())) # Debug print
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FlashVSR-v1.1")
     mm.load_models([
@@ -238,20 +239,18 @@ def prepare_input_tensor_for_tile(image_tensor: torch.Tensor, device, scale: int
     clean_vram()
     return vid_final, tH, tW, num_frames_padded
 
-def run_image_inference(image_input_path, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w, num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap, num_inference_steps_val, num_frames_for_sequence_val):
-    if image_input_path is None:
-        raise gr.Error("No image uploaded.")
-
+# --- Core Upscaling Logic ---
+def _upscale_core_logic(image_pil: Image.Image, scale: int, tiled: bool, tile_size_h: int, tile_size_w: int, tile_stride_h: int, tile_stride_w: int, num_persistent_param_in_dit: int, tiled_dit: bool, dit_tile_size: int, dit_tile_overlap: int, num_inference_steps_val: int, num_frames_for_sequence_val: int) -> Image.Image:
+    
     pipe = init_pipeline(num_persistent_param_in_dit)
     
     dtype, device = torch.bfloat16, 'cuda'
     
-    image = Image.open(image_input_path).convert('RGB')
-    frame_tensor = torch.from_numpy(np.array(image)).to(dtype=dtype).unsqueeze(0)
-
+    frame_tensor = torch.from_numpy(np.array(image_pil)).to(dtype=dtype).unsqueeze(0) # 1 H W C
+    
     if tiled_dit:
         num_frames_for_sequence = num_frames_for_sequence_val
-        frames = frame_tensor.repeat(num_frames_for_sequence, 1, 1, 1)
+        frames = frame_tensor.repeat(num_frames_for_sequence, 1, 1, 1) # N H W C
 
         N, H, W, C = frames.shape
         tile_coords = calculate_tile_coords(H, W, dit_tile_size, dit_tile_overlap)
@@ -261,7 +260,7 @@ def run_image_inference(image_input_path, scale, tiled, tile_size_h, tile_size_w
 
         print(f"Processing in {len(tile_coords)} tiles...")
         for i, (x1, y1, x2, y2) in enumerate(tqdm(tile_coords, desc="[FlashVSR] Processing image tiles")):
-            input_tile = frames[:, y1:y2, x1:x2, :]
+            input_tile = frames[:, y1:y2, x1:x2, :] # N H_tile W_tile C
             
             LQ_tile, th, tw, F = prepare_input_tensor_for_tile(input_tile, device, scale=scale, dtype=dtype)
             LQ_tile = LQ_tile.to(device)
@@ -284,11 +283,11 @@ def run_image_inference(image_input_path, scale, tiled, tile_size_h, tile_size_w
                     color_fix = True,
                 )
             
-            single_frame_output_tensor = processed_tile_output_tensor[:, 0, :, :]
+            single_frame_output_tensor = processed_tile_output_tensor[:, 0, :, :] # C H_tile_out W_tile_out
             
-            processed_tile_tensor_0_1 = ((single_frame_output_tensor + 1.0) / 2.0).permute(1, 2, 0).cpu().float()
+            processed_tile_tensor_0_1 = ((single_frame_output_tensor + 1.0) / 2.0).permute(1, 2, 0).cpu().float() # H_tile_out W_tile_out C
             
-            mask = create_feather_mask((processed_tile_tensor_0_1.shape[0], processed_tile_tensor_0_1.shape[1]), dit_tile_overlap * scale).cpu()
+            mask = create_feather_mask((processed_tile_tensor_0_1.shape[0], processed_tile_tensor_0_1.shape[1]), dit_tile_overlap * scale).cpu() # H_tile_out W_tile_out
             
             mask_expanded = mask.squeeze(0).squeeze(0).unsqueeze(2).repeat(1, 1, 3)
 
@@ -310,19 +309,87 @@ def run_image_inference(image_input_path, scale, tiled, tile_size_h, tile_size_w
     else:
         raise gr.Error("Non-tiled DiT for images is not recommended. Please enable 'Tiled DiT'.")
 
-    output_dir = "outputs"
-    os.makedirs(output_dir, exist_ok=True)
-    # Create a unique filename for the output image
-    input_filename = os.path.basename(image_input_path)
-    name, ext = os.path.splitext(input_filename)
-    output_filename = f"{name}_{scale}x_upscaled.png" # Always save as PNG for quality
-    output_path = os.path.join(output_dir, output_filename)
-    output_image_pil.save(output_path)
-
     del pipe
     clean_vram()
     
-    return output_path
+    return output_image_pil
+
+
+def unified_image_inference(input_path_textbox_val: str, input_upload_val: str | None, output_folder_path: str, process_mode: str, scale: int, tiled: bool, tile_size_h: int, tile_size_w: int, tile_stride_h: int, tile_stride_w: int, num_persistent_param_in_dit: int, tiled_dit: bool, dit_tile_size: int, dit_tile_overlap: int, num_inference_steps_val: int, num_frames_for_sequence_val: int):
+    
+    output_image_display = gr.Image(visible=False) # Default to invisible
+    batch_status_text = ""
+
+    if not output_folder_path:
+        output_folder_path = "outputs"
+    os.makedirs(output_folder_path, exist_ok=True)
+
+    if process_mode == "Single File":
+        input_file_path = input_upload_val
+        if not input_file_path:
+            raise gr.Error("No image file uploaded for Single File mode.")
+        if not os.path.isfile(input_file_path):
+            raise gr.Error(f"Input Path '{input_file_path}' is not a valid file.")
+        
+        try:
+            image_pil = Image.open(input_file_path).convert('RGB')
+        except Exception as e:
+            raise gr.Error(f"Could not open image file: {e}")
+
+        upscaled_image_pil = _upscale_core_logic(
+            image_pil, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w,
+            num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap,
+            num_inference_steps_val, num_frames_for_sequence_val
+        )
+
+        input_filename = os.path.basename(input_file_path)
+        name, ext = os.path.splitext(input_filename)
+        output_filename = f"{name}_{scale}x_upscaled.png"
+        final_output_path = os.path.join(output_folder_path, output_filename)
+        upscaled_image_pil.save(final_output_path)
+        
+        return gr.Image(value=final_output_path, visible=True), "Single image processed and saved."
+
+    elif process_mode == "Batch Folder":
+        input_folder_path = input_path_textbox_val
+        if not input_folder_path:
+            raise gr.Error("Input Folder Path cannot be empty for Batch Folder mode.")
+        if not os.path.isdir(input_folder_path):
+            raise gr.Error(f"Input Path '{input_folder_path}' is not a valid directory for Batch Folder mode.")
+        
+        image_files = list_images_natural(input_folder_path)
+        if not image_files:
+            raise gr.Error(f"No supported image files found in '{input_folder_path}'.")
+
+        processed_count = 0
+        for img_path in tqdm(image_files, desc="[FlashVSR] Batch Processing"):
+            try:
+                image_pil = Image.open(img_path).convert('RGB')
+                upscaled_image_pil = _upscale_core_logic(
+                    image_pil, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w,
+                    num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap,
+                    num_inference_steps_val, num_frames_for_sequence_val
+                )
+
+                input_filename = os.path.basename(img_path)
+                name, ext = os.path.splitext(input_filename)
+                output_filename = f"{name}_{scale}x_upscaled.png"
+                final_output_path = os.path.join(output_folder_path, output_filename)
+                upscaled_image_pil.save(final_output_path)
+                processed_count += 1
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+                # Continue with other images in batch
+        
+        if processed_count == 0:
+            batch_status_text = f"No images were successfully processed in batch from {input_folder_path}."
+        else:
+            batch_status_text = f"Batch processing complete. {processed_count} images saved to {output_folder_path}."
+        
+        return gr.Image(visible=False), batch_status_text # For batch mode, hide image output and show status message
+
+    return gr.Image(visible=False), "Invalid processing mode selected."
+
 
 def run_inference(video_path, scale, tiled, tile_size_h, tile_size_w, tile_stride_h, tile_stride_w, num_persistent_param_in_dit, tiled_dit, dit_tile_size, dit_tile_overlap, num_inference_steps_val):
     
@@ -429,7 +496,14 @@ with gr.Blocks() as demo:
         with gr.TabItem("Image"):
             with gr.Row():
                 with gr.Column():
-                    image_input = gr.Image(type="filepath", label="Input Image")
+                    process_mode_radio = gr.Radio(
+                        ["Single File", "Batch Folder"], label="Processing Mode", value="Single File"
+                    )
+                    image_input_path_textbox = gr.Textbox(label="Input Path (Folder for Batch)", placeholder="Enter folder path for batch processing", visible=False)
+                    image_input_upload_component = gr.Image(type="filepath", label="Upload Image (Single File)", visible=True)
+                    
+                    image_output_folder_path_textbox = gr.Textbox(label="Output Folder Path", placeholder="Enter folder path to save outputs", value="outputs")
+                    
                     image_scale_slider = gr.Slider(minimum=1, maximum=4, step=1, label="Scale Factor", value=4)
                     image_num_inference_steps_slider = gr.Slider(minimum=1, maximum=100, step=1, label="Inference Steps", value=20)
                     image_num_frames_for_sequence_slider = gr.Slider(minimum=1, maximum=25, step=1, label="Frames per Tile (Image)", value=25)
@@ -444,11 +518,32 @@ with gr.Blocks() as demo:
                     with gr.Row():
                         image_dit_tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, label="DiT Tile Size", value=256)
                         image_dit_tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, label="DiT Tile Overlap", value=24)
-                    image_run_button = gr.Button("Run Image Inference")
+                    image_run_inference_button = gr.Button("Run Inference")
                 with gr.Column():
-                    image_output = gr.Image(type="pil", label="Output Image")
+                    image_output = gr.Image(type="pil", label="Output Image (Single File Mode)", visible=True)
+                    image_batch_status_text = gr.Textbox(label="Batch Status", interactive=False, visible=False)
+
 
     num_persistent_param_in_dit_slider = gr.Slider(minimum=0, maximum=10000000, step=100000, label="Persistent Parameters in DiT", value=0, interactive=True)
+
+    # Dynamic visibility for image input components
+    process_mode_radio.change(
+        lambda mode: gr.Image(visible=mode == "Single File"),
+        inputs=[process_mode_radio],
+        outputs=[image_input_upload_component]
+    ).then(
+        lambda mode: gr.Textbox(visible=mode == "Batch Folder"),
+        inputs=[process_mode_radio],
+        outputs=[image_input_path_textbox]
+    ).then(
+        lambda mode: gr.Image(visible=mode == "Single File"),
+        inputs=[process_mode_radio],
+        outputs=[image_output]
+    ).then(
+        lambda mode: gr.Textbox(visible=mode == "Batch Folder"),
+        inputs=[process_mode_radio],
+        outputs=[image_batch_status_text]
+    )
 
     video_run_button.click(
         fn=run_inference,
@@ -456,10 +551,27 @@ with gr.Blocks() as demo:
         outputs=video_output,
     )
     
-    image_run_button.click(
-        fn=run_image_inference,
-        inputs=[image_input, image_scale_slider, image_tiled_checkbox, image_tile_size_h_slider, image_tile_size_w_slider, image_tile_stride_h_slider, image_tile_stride_w_slider, num_persistent_param_in_dit_slider, image_tiled_dit_checkbox, image_dit_tile_size_slider, image_dit_tile_overlap_slider, image_num_inference_steps_slider, image_num_frames_for_sequence_slider],
-        outputs=image_output,
+    image_run_inference_button.click(
+        fn=unified_image_inference,
+        inputs=[
+            image_input_path_textbox,
+            image_input_upload_component, # Pass the upload component value
+            image_output_folder_path_textbox,
+            process_mode_radio,
+            image_scale_slider,
+            image_tiled_checkbox,
+            image_tile_size_h_slider,
+            image_tile_size_w_slider,
+            image_tile_stride_h_slider,
+            image_tile_stride_w_slider,
+            num_persistent_param_in_dit_slider,
+            image_tiled_dit_checkbox,
+            image_dit_tile_size_slider,
+            image_dit_tile_overlap_slider,
+            image_num_inference_steps_slider,
+            image_num_frames_for_sequence_slider
+        ],
+        outputs=[image_output, image_batch_status_text],
     )
 
 demo.launch()
